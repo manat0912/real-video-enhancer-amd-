@@ -1,0 +1,794 @@
+diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -263,6 +263,8 @@
+             total_ncnn_gpus=total_ncnn_gpus,
+             total_pytorch_gpus=total_pytorch_gpus,
+         )
++        from src.ui.AMDAcceleration import install_acceleration_menu
++        install_acceleration_menu(self)
+         downloadDeps = DownloadDependencies(False)
+         self.downloadTab.hideUninstallButtons()
+         self.downloadTab.showUninstallButton(self.backends)
+diff --git a/backend/src/FFmpeg.py b/backend/src/FFmpeg.py
+--- a/backend/src/FFmpeg.py
++++ b/backend/src/FFmpeg.py
+@@ -72,7 +72,7 @@
+         self.border_detect = border_detect
+         self.previewFrame = None
+         self.last_length = 0
+-        self.framesRendered = 1
++        self.framesRendered = 0
+         self.hdr_mode = hdr_mode
+         self.sharedMemoryChunkSize = sharedMemoryChunkSize
+ 
+@@ -148,9 +148,9 @@
+             
+             if self.previewFrame is not None and self.framesRendered > 0:
+                 # print out data to stdout
+-                fps = round(self.framesRendered / (time.time() - self.startTime))
++                fps = self.framesRendered / max(time.time() - self.startTime, 1e-9)
+                 eta = self.calculateETA(framesRendered=self.framesRendered)
+-                message = f"FPS: {fps} Current Frame: {self.framesRendered} ETA: {eta}"
++                message = f"FPS: {fps:.2f} Current Frame: {self.framesRendered} ETA: {eta}"
+                 if i == 0:
+                     print("\n", file=sys.stderr)
+                     i = 1
+diff --git a/backend/src/FFmpegBuffers.py b/backend/src/FFmpegBuffers.py
+--- a/backend/src/FFmpegBuffers.py
++++ b/backend/src/FFmpegBuffers.py
+@@ -76,7 +76,7 @@
+             stdout=subprocess.PIPE,
+             stderr=subprocess.DEVNULL,
+         )
+-        self.readQueue = queue.Queue(maxsize=25)
++        self.readQueue = queue.Queue(maxsize=max(1, min(25, int(os.environ.get("RVE_QUEUE_DEPTH", "8")))))
+ 
+     def command(self):
+         
+@@ -205,7 +205,7 @@
+         self.mpv_output = mpv_output
+         self.hdr_mode = hdr_mode
+         self.merge_subtitles = merge_subtitles
+-        self.writeQueue = queue.Queue(maxsize=25)
++        self.writeQueue = queue.Queue(maxsize=max(1, min(25, int(os.environ.get("RVE_QUEUE_DEPTH", "8")))))
+         self.previewFrame = None
+         self.framesRendered: int = 1
+         self.writeProcess = None
+@@ -457,6 +457,7 @@
+         self.startTime = time.time()
+ 
+         exit_code: int = 0
++        frames_written = 0
+         try:
+             while True:
+                 frame = self.writeQueue.get()
+@@ -464,6 +465,7 @@
+                     break
+                 
+                 self.writeProcess.stdin.buffer.write(frame)
++                frames_written += 1
+ 
+             self.writeProcess.stdin.close()
+             self.writeProcess.wait()
+@@ -471,10 +473,17 @@
+ 
+             renderTime = time.time() - self.startTime
+             log(f"\nTime to complete render: {round(renderTime, 2)}")
++            if exit_code == 0:
++                fps = frames_written / max(renderTime, 1e-9)
++                speed = fps / max(self.outputFPS, 1e-9)
++                print(f"\nFPS: {fps:.2f} Current Frame: {frames_written} ETA: 0:00:00", flush=True)
++                stages = "including decode; video encoding disabled" if self.benchmark else "including decode and encode"
++                log(f"Completed {frames_written} frames; pipeline throughput {fps:.2f} FPS ({speed:.2f}x playback speed), {stages}.")
+             
+         except Exception as e:
+             log(str(e))
+             self.onErroredExit()
++            return
+ 
+         if exit_code != 0:
+             self.onErroredExit()
+@@ -558,4 +567,4 @@
+         """
+         if self.proc:
+             self.proc.terminate()
+-            self.proc.wait()
+\ No newline at end of file
++            self.proc.wait()
+diff --git a/backend/src/RenderVideo.py b/backend/src/RenderVideo.py
+--- a/backend/src/RenderVideo.py
++++ b/backend/src/RenderVideo.py
+@@ -184,10 +184,16 @@
+             )
+ 
+         log("Using backend: " + self.backend)
++        # A single PyTorch upscaler has no other model competing for VRAM.
++        # Keep it loaded instead of reading and initializing its weights twice.
++        reload_upscaler = bool(upscaleModel and (
++            self.backend != "pytorch" or interpolateModel or extraRestorationModels
++        ))
+         # upscale has to be called first to get the scale of the upscale model
+         if upscaleModel:
+             self.setupUpscale()
+-            self.upscaleOption.hotUnload()  # unload model to free up memory for trt enging building
++            if reload_upscaler:
++                self.upscaleOption.hotUnload()
+             log("Using Upscaling Model: " + self.upscaleModel)
+         else:
+             self.upscaleTimes = 1  # if no upscaling, it will default to 1
+@@ -208,7 +214,7 @@
+             self.setupInterpolate()
+             log("Using Interpolation Model: " + self.interpolateModel)
+ 
+-        if upscaleModel: # load model after interpolation model is loaded, this saves on vram if the user builds 2 separate engines
++        if reload_upscaler:
+             self.upscaleOption.hotReload()
+ 
+         for extraRestoration in self.extraRestorationModels:
+@@ -535,4 +541,4 @@
+                 max_timestep=self.maxTimestep,
+                 hdr_mode=self.hdr_mode,
+                 trt_static_shape= not self.trt_dynamic_shapes,  # if dynamic shapes are enabled, we have to set the static shape to false (default is true in the model
+-            )
+\ No newline at end of file
++            )
+diff --git a/backend/src/pytorch/Acceleration.py b/backend/src/pytorch/Acceleration.py
+new file mode 100644
+--- /dev/null
++++ b/backend/src/pytorch/Acceleration.py
+@@ -0,0 +1,25 @@
++"""Single-GPU inference controls shared by CUDA and native ROCm/HIP."""
++import os
++import torch
++
++
++def fast_profile():
++    return os.environ.get("RVE_FAST_INFERENCE", "0") == "1"
++
++
++def move_to_device(tensor, device):
++    if os.environ.get("RVE_USE_ACCELERATE", "0") == "1":
++        from accelerate.utils import send_to_device
++        # Use the selected GPU, including HIP's torch.cuda device interface.
++        return send_to_device(tensor, device, non_blocking=True)
++    return tensor.to(device=device, non_blocking=True)
++
++
++def configure_model(model, device):
++    if fast_profile() and device.type == "cuda":
++        # ROCm uses this PyTorch API for MIOpen convolution selection as well.
++        torch.backends.cudnn.benchmark = os.environ.get("RVE_TUNE_CONVOLUTION") == "1"
++        with torch.inference_mode(False):
++            model.to(memory_format=torch.channels_last)
++        return True
++    return False
+diff --git a/backend/src/pytorch/TorchUtils.py b/backend/src/pytorch/TorchUtils.py
+--- a/backend/src/pytorch/TorchUtils.py
++++ b/backend/src/pytorch/TorchUtils.py
+@@ -12,6 +12,7 @@
+ )
+ HAS_PYTORCH_CUDA = CudaChecker().HAS_PYTORCH_CUDA
+ import numpy as np
++from .Acceleration import move_to_device
+ 
+ def dummy_function(*args, **kwargs):
+     """
+@@ -63,11 +64,6 @@
+             self.use_numpy = False
+         self.__run_stream_func = self.__run_stream_function()
+         self.__sync_all_streams_func = self.__sync_all_streams_function()
+-
+-        # persistent pinned buffer for async GPU uploads
+-        self._pinned_buffer = None
+-        self._pinned_buffer_numel = 0
+-        self._pinned_buffer_dtype = None
+ 
+     def __sync_all_streams_function(self):
+         if self.device_type == "cuda":
+@@ -172,11 +168,11 @@
+     @torch.inference_mode()
+     def frame_to_tensor(self, frame, stream: torch.Stream, device: torch.device, dtype: torch.dtype) -> torch.Tensor: # stream might be None
+         with self.run_stream(stream):  # type: ignore
+-             # ... (tensor creation and manipulation) ...
+             frame = torch.frombuffer(
+                     frame,
+                     dtype=torch.uint16 if self.hdr_mode else torch.uint8,
+-                ).to(device=device, non_blocking=True) 
++                )
++            frame = move_to_device(frame, device)
+             
+             frame = (
+                 frame
+@@ -197,8 +193,7 @@
+     def clear_cache():
+         if HAS_PYTORCH_CUDA:
+             torch.cuda.empty_cache()
+-            torch.cuda.reset_max_memory_allocated()
+-            torch.cuda.reset_max_memory_cached()
++            torch.cuda.reset_peak_memory_stats()
+     
+     @torch.inference_mode()
+     def tensor_to_frame(self, frame: torch.Tensor):
+@@ -225,7 +220,7 @@
+     @torch.inference_mode()
+     def np_to_tensor(arr: np.ndarray, device, dtype):
+         import torch
+-        return torch.from_numpy(arr).to(device=device, dtype=dtype).permute(2, 0, 1).unsqueeze(0)
++        return move_to_device(torch.from_numpy(arr), device).to(dtype=dtype).permute(2, 0, 1).unsqueeze(0)
+ 
+     
+     @staticmethod
+@@ -246,4 +241,4 @@
+             size=(new_height, new_width),
+             mode=mode,
+             align_corners=False if mode in ["linear", "bilinear", "bicubic", "trilinear"] else None,
+-        )
+\ No newline at end of file
++        )
+diff --git a/backend/src/pytorch/UpscaleModelWrapper.py b/backend/src/pytorch/UpscaleModelWrapper.py
+--- a/backend/src/pytorch/UpscaleModelWrapper.py
++++ b/backend/src/pytorch/UpscaleModelWrapper.py
+@@ -1,6 +1,7 @@
+ import torch
+ from ..utils.Util import log
+ from .TorchUtils import TorchUtils
++from .Acceleration import configure_model
+ from .VSRArchs.AnimeSR.vsr_inference_helper import AnimeSRInferenceHelper
+ from .VSRArchs.AnimeSR.animesr_arch import AnimeSR
+ from .VSRArchs.TSPAN.vsr_inference_helper import TemporalSPANInferenceHelper
+@@ -13,13 +14,19 @@
+         self.__dummy_input_pre_channels = None
+         self.__channels = 3
+         self.__inference_mode = None
+-        self.load_model()
+-        self.set_precision(self.__precision)
++        # ROCm/MIOpen inspects weight version counters when caching kernels.
++        # Parameters loaded as inference tensors do not have those counters.
++        with torch.inference_mode(False):
++            self.load_model()
++            self.set_precision(self.__precision)
+         self.__test_model_precision()
++        # Temporal helpers have state and 5D inputs; optimize image models only.
++        self.__channels_last = self.__inference_mode == 'spandrel' and configure_model(self.__model, self.__device)
+ 
+     def set_precision(self, precision: torch.dtype):
+         self.__precision = precision
+-        self.__model.to(self.__device, dtype=precision)
++        with torch.inference_mode(False):
++            self.__model.to(self.__device, dtype=precision)
+ 
+     def get_model(self):
+         return self.__model
+@@ -48,7 +55,11 @@
+             except Exception as e:
+                 log(f"Model precision {self.__precision} not supported, falling back to float32: {e}")
+                 self.set_precision(torch.float32)
++                test_input = test_input.to(dtype=torch.float32)
+                 self.__test_inference(test_input)
++
++    def get_precision(self):
++        return self.__precision
+     
+     def get_dummy_input(self, width: int, height: int) -> torch.Tensor:
+         assert self.__dummy_input_pre_channels is not None, "Dummy input pre channels not set."
+@@ -58,7 +69,6 @@
+         dummy_input.append(width)
+         return torch.zeros(dummy_input, dtype=self.__precision, device=self.__device)
+     
+-    @torch.inference_mode()
+     def load_model(self, model=None) -> torch.nn.Module:
+         if not model:
+             from .spandrel import ModelLoader, ImageModelDescriptor, UnsupportedModelError
+@@ -105,4 +115,8 @@
+                 self.inference_helper = TemporalSPANInferenceHelper(model=model, scale=self.__scale)
+     def __call__(self, *args, **kwargs):
+         assert self.inference_helper is not None, "Inference helper is not initialized."
+-        return self.inference_helper(*args, **kwargs).clone()
+\ No newline at end of file
++        # Keep inputs consistent when a model rejects FP16 and falls back.
++        args = tuple(value.to(dtype=self.__precision) if isinstance(value, torch.Tensor) else value for value in args)
++        if self.__channels_last:
++            args = tuple(value.contiguous(memory_format=torch.channels_last) if isinstance(value, torch.Tensor) and value.ndim == 4 else value for value in args)
++        return self.inference_helper(*args, **kwargs).clone()
+diff --git a/backend/src/utils/BackendDetect.py b/backend/src/utils/BackendDetect.py
+--- a/backend/src/utils/BackendDetect.py
++++ b/backend/src/utils/BackendDetect.py
+@@ -1,5 +1,5 @@
+ 
+-from .Util import log_error, suppress_stdout_stderr
++from .Util import log, log_error, suppress_stdout_stderr
+ 
+ class BackendDetect:
+     def __init__(self):
+@@ -34,8 +34,9 @@
+             try:
+                 from upscale_ncnn_py import UPSCALE
+             except ImportError:
+-                log_error(
+-                    "Warning: Cannot import upscale_ncnn, falling back to default ncnn processing. (Please install vcredlist on your computer to fix this!)"
++                log(
++                    "Warning: Cannot import upscale_ncnn, falling back to default ncnn processing.",
++                    show_backend=False,
+                 )
+             self.__ncnn = ncnn
+         except ImportError as e:
+@@ -46,8 +47,10 @@
+ 
+ 
+     def __get_pytorch_device(self):
+-        if "cu" in self.__torch.__version__: return "cuda" 
+-        if "rocm" in self.__torch.__version__: return "rocm"
++        # HIP wheels can use '+rocmsdk...' tags. Detect runtime availability,
++        # rather than advertising a GPU backend from a wheel's name alone.
++        if self.__torch.cuda.is_available():
++            return "rocm" if getattr(self.__torch.version, "hip", None) else "cuda"
+         if self.__torch.xpu.is_available(): return "xpu"
+         if self.__torch.backends.mps.is_available(): return "mps"
+         return "CPU"
+@@ -78,7 +81,7 @@
+         devices = []
+         
+         if self.__torch:
+-            if self.pytorch_device == "CPU": return self.pytorch_device
++            if self.pytorch_device == "CPU": return ["CPU"]
+             if self.pytorch_device.lower() == "mps": return [{"index": 0, "name": "Apple MPS"}]
+             torch_cmd_dict = {
+             "cuda": self.__torch.cuda,
+@@ -128,4 +131,4 @@
+                 return ["CPU"]
+             except Exception as e:
+                 log_error(str(e))
+-                return "Unable to get NCNN GPU"
+\ No newline at end of file
++                return "Unable to get NCNN GPU"
+diff --git a/backend/src/utils/Frame.py b/backend/src/utils/Frame.py
+--- a/backend/src/utils/Frame.py
++++ b/backend/src/utils/Frame.py
+@@ -72,7 +72,13 @@
+             raise TypeError(f"Expected torch.Tensor, got {type(frame).__name__}")
+         self._invalidate_cache("tensor")
+         self._tensor = frame.clone()
+-        _torch_utils.sync_all_streams()
++        # The owned copy must be ready for consumers on other streams. Wait
++        # for its producer, without stalling unrelated decode/inference work.
++        from ..pytorch.Acceleration import fast_profile
++        if fast_profile() and self._tensor.device.type == "cuda":
++            _torch.cuda.current_stream(self._tensor.device).synchronize()
++        else:
++            _torch_utils.sync_all_streams()
+         return self
+ 
+     def set_frame_np(self, frame: Any) -> "Frame":
+@@ -183,7 +189,7 @@
+             dtype=self.dtype,
+         )
+         if self._tensor is not None:
+-            new_frame.set_frame_tensor(self._tensor.clone())
++            new_frame.set_frame_tensor(self._tensor)
+         if self._np is not None:
+             new_frame.set_frame_np(self._np.copy())
+         if self._bytes is not None:
+diff --git a/scripts/benchmark_upscale.py b/scripts/benchmark_upscale.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/benchmark_upscale.py
+@@ -0,0 +1,66 @@
++"""Measure warm model inference separately from decode/encode throughput."""
++import argparse
++import json
++import os
++from pathlib import Path
++import sys
++import time
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model", required=True)
++    parser.add_argument("--width", type=int, default=640)
++    parser.add_argument("--height", type=int, default=360)
++    parser.add_argument("--frames", type=int, default=30)
++    parser.add_argument("--warmup", type=int, default=3)
++    parser.add_argument("--gpu", type=int, default=0)
++    parser.add_argument("--profile", choices=("fast", "tuned", "compatibility"), default="fast")
++    parser.add_argument("--precision", choices=("float16", "float32"), default="float16")
++    parser.add_argument("--json", dest="json_path")
++    args = parser.parse_args()
++    if min(args.width, args.height, args.frames) < 1 or args.warmup < 0:
++        parser.error("Dimensions and frame count must be positive, warmup must be nonnegative")
++    os.environ["RVE_FAST_INFERENCE"] = "1" if args.profile in ("fast", "tuned") else "0"
++    os.environ["RVE_TUNE_CONVOLUTION"] = "1" if args.profile == "tuned" else "0"
++    os.environ["RVE_USE_ACCELERATE"] = "1"
++    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
++    import torch
++    from src.pytorch.UpscaleModelWrapper import UpscaleModelWrapper
++    from src.pytorch.Acceleration import move_to_device
++    if not torch.cuda.is_available():
++        raise RuntimeError("A working ROCm or CUDA GPU is required for this benchmark")
++    device = torch.device("cuda", args.gpu)
++    torch.cuda.set_device(device)
++    dtype = getattr(torch, args.precision)
++    startup = time.perf_counter()
++    wrapper = UpscaleModelWrapper(str(Path(args.model).resolve()), device, dtype)
++    input_frame = move_to_device(torch.rand(1, 3, args.height, args.width), device).to(dtype=wrapper.get_precision())
++    with torch.inference_mode():
++        for _ in range(args.warmup):
++            output = wrapper(input_frame)
++        torch.cuda.synchronize(device)
++        startup = time.perf_counter() - startup
++        torch.cuda.reset_peak_memory_stats(device)
++        started = time.perf_counter()
++        for _ in range(args.frames):
++            output = wrapper(input_frame)
++        torch.cuda.synchronize(device)
++        elapsed = time.perf_counter() - started
++    report = {
++        "measurement": "warm model inference only; excludes video decoding, transfers per frame, encoding and restoration/interpolation passes",
++        "gpu": torch.cuda.get_device_name(device), "torch": torch.__version__, "hip": torch.version.hip,
++        "model": Path(args.model).name, "profile": args.profile, "precision": str(wrapper.get_precision()),
++        "input": [args.width, args.height], "output": [output.shape[-1], output.shape[-2]],
++        "frames": args.frames, "startup_and_warmup_seconds": round(startup, 3),
++        "elapsed_seconds": round(elapsed, 3), "inference_fps": round(args.frames / elapsed, 2),
++        "peak_vram_gib": round(torch.cuda.max_memory_allocated(device) / 1024**3, 3),
++    }
++    content = json.dumps(report, indent=2)
++    print(content)
++    if args.json_path:
++        Path(args.json_path).write_text(content + "\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/check_acceleration.py b/scripts/check_acceleration.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/check_acceleration.py
+@@ -0,0 +1,49 @@
++"""Native runtime smoke test, also used by the launcher's installation step."""
++import argparse
++import importlib.metadata
++import json
++from pathlib import Path
++import sys
++
++
++def diagnose(require_rocm=False):
++    report = {"python": sys.executable, "python_version": sys.version.split()[0]}
++    try:
++        import torch
++        if not torch.cuda.is_available():
++            report["action"] = "No ROCm/CUDA GPU runtime detected. Select NCNN for Vulkan, or check the installed PyTorch build and AMD driver."
++        report.update(torch=torch.__version__, hip=torch.version.hip, gpu_available=torch.cuda.is_available())
++        if torch.cuda.is_available():
++            report["gpus"] = [{"index": i, "name": torch.cuda.get_device_name(i), "vram_gib": round(torch.cuda.get_device_properties(i).total_memory / 1024**3, 1)} for i in range(torch.cuda.device_count())]
++            # Test a real FP16 convolution, rather than only device enumeration.
++            device = torch.device("cuda", 0)
++            layer = torch.nn.Conv2d(3, 8, 3, padding=1).to(device=device, dtype=torch.float16)
++            output = layer(torch.ones(1, 3, 64, 64, device=device, dtype=torch.float16))
++            torch.cuda.synchronize(device)
++            report["fp16_convolution"] = bool(torch.isfinite(output).all().item())
++        report["accelerate"] = importlib.metadata.version("accelerate")
++        success = (not require_rocm) or bool(torch.version.hip and report.get("fp16_convolution"))
++    except Exception as error:
++        report["error"] = str(error)
++        success = False
++    if not success:
++        report["action"] = "Use Python 3.12 and supported ROCm wheels; check the AMD driver and GPU compatibility matrix."
++    print(json.dumps(report, indent=2))
++    return success
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--require-rocm", action="store_true")
++    parser.add_argument("--mark-ready", action="store_true", help="Validate ROCm and register this launcher environment")
++    args = parser.parse_args()
++    marker = Path(sys.prefix) / ".ready" if args.mark_ready else None
++    if marker is not None:
++        expected = Path(__file__).resolve().parents[1] / "env-rocm"
++        if marker.parent.resolve() != expected.resolve() or sys.prefix == sys.base_prefix:
++            parser.error("--mark-ready must use the app's env-rocm environment")
++        marker.unlink(missing_ok=True)
++    if not diagnose(args.require_rocm or args.mark_ready):
++        sys.exit(1)
++    if marker is not None:
++        marker.write_text("Native ROCm FP16 convolution passed.\n", encoding="utf-8")
+diff --git a/src/Backendhandler.py b/src/Backendhandler.py
+--- a/src/Backendhandler.py
++++ b/src/Backendhandler.py
+@@ -1,4 +1,5 @@
+ import os
++import ast
+ 
+ from .constants import BACKEND_PATH, PYTHON_EXECUTABLE_PATH, PYTHON_DIRECTORY, PLATFORM, IS_INSTALLED, IS_FLATPAK, HAS_NETWORK_ON_STARTUP, CWD
+ from .Util import (
+@@ -49,7 +50,7 @@
+ 
+         # Convert the string representation of the list to an actual list
+         try:
+-            backends = eval(backends_str)
++            backends = ast.literal_eval(backends_str)
+         except Exception:
+             backends = []
+ 
+diff --git a/src/DownloadDeps.py b/src/DownloadDeps.py
+--- a/src/DownloadDeps.py
++++ b/src/DownloadDeps.py
+@@ -100,6 +100,8 @@
+         extractTarGZ(self.download_path)
+     
+     def get_if_update_available(self) -> bool:
++        if USE_LOCAL_BACKEND:
++            return False
+         try:
+             process = subprocess_popen_without_terminal(
+                 [PYTHON_EXECUTABLE_PATH, os.path.join(BACKEND_PATH, "rve-backend.py"), "--version"],
+@@ -147,6 +149,9 @@
+         return link
+ 
+     def download(self):
++        from .constants import USE_LAUNCHER_PYTHON
++        if USE_LAUNCHER_PYTHON:
++            return
+         needs_network_else_exit()
+         download_link = self.get_download_link()
+         FileHandler.createDirectory(os.path.dirname(self.download_path))
+@@ -157,6 +162,9 @@
+         return subprocess.run([PYTHON_EXECUTABLE_PATH, "--version"], check=True, capture_output=True, text=True).stdout.strip().split(" ")[1] # this extracts the version number from the output
+     
+     def get_if_update_available(self) -> bool:
++        from .constants import USE_LAUNCHER_PYTHON
++        if USE_LAUNCHER_PYTHON:
++            return False
+         try:
+             output = self.get_version()
+         except subprocess.CalledProcessError: # if python is not found
+@@ -415,4 +423,4 @@
+         for return_code in return_codes:
+             if return_code != 0:
+                 return return_code
+-        return 0
+\ No newline at end of file
++        return 0
+diff --git a/src/GenerateFFMpegCommand.py b/src/GenerateFFMpegCommand.py
+--- a/src/GenerateFFMpegCommand.py
++++ b/src/GenerateFFMpegCommand.py
+@@ -193,15 +193,13 @@
+                 command +=["-c:v","av1_vaapi"]
+                 command +=["-crf", str(self._get_video_quality(self._video_quality))]
+ 
+-            case "h264_amf":
+-                command +=["-c:v","h264_amf"]
+-                command +=["-crf", str(self._get_video_quality(self._video_quality))]
+-            case "h265_amf":
+-                command +=["-c:v","hevc_amf"]
+-                command +=["-crf", str(self._get_video_quality(self._video_quality))]
+-            case "av1_amf":
+-                command +=["-c:v","av1_amf"]
+-                command +=["-crf", str(self._get_video_quality(self._video_quality))]
++            case "h264_amf" | "h265_amf" | "av1_amf":
++                if self._video_quality == "Lossless":
++                    raise ValueError("AMF does not guarantee lossless output. Select FFV1 for lossless encoding.")
++                codec = {"h264_amf": "h264_amf", "h265_amf": "hevc_amf", "av1_amf": "av1_amf"}[self._video_encoder]
++                quality = "speed" if self._video_encoder_speed in ("fast", "fastest") else "quality" if self._video_encoder_speed in ("slow", "placebo") else "balanced"
++                qp = str(self._get_video_quality(self._video_quality))
++                command += ["-c:v", codec, "-quality", quality, "-rc", "cqp", "-qp_i", qp, "-qp_p", qp]
+             case _:
+                 command +=["-c:v", self._video_encoder]
+                 command +=["-crf", str(self._get_video_quality(self._video_quality))]
+diff --git a/src/constants.py b/src/constants.py
+--- a/src/constants.py
++++ b/src/constants.py
+@@ -78,6 +78,11 @@
+     if PLATFORM == "win32"
+     else os.path.join(CWD, "python", "python", "bin", "python3")
+ )
++# Pinokio manages one environment for both the GUI and the render subprocess.
++# Standalone/frozen distributions retain their bundled interpreter.
++USE_LAUNCHER_PYTHON = os.environ.get("RVE_USE_LAUNCHER_PYTHON") == "1" and not IS_COMPILED_OR_FROZEN
++if USE_LAUNCHER_PYTHON:
++    PYTHON_EXECUTABLE_PATH = sys.executable
+ #PYTHON_VERSION = "3.13.2" if PLATFORM != "darwin" else "3.12.9" # sets python version of backend
+ PYTHON_VERSION = "3.12.9"
+ 
+diff --git a/src/ui/AMDAcceleration.py b/src/ui/AMDAcceleration.py
+new file mode 100644
+--- /dev/null
++++ b/src/ui/AMDAcceleration.py
+@@ -0,0 +1,130 @@
++"""Acceleration settings without changing Designer-generated GUI code."""
++import os
++from PySide6.QtCore import QProcess, QSettings, QUrl
++from PySide6.QtGui import QDesktopServices
++from PySide6.QtWidgets import (
++    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
++    QLabel, QPushButton, QSpinBox, QTextEdit, QVBoxLayout,
++)
++from ..constants import CWD, PYTHON_EXECUTABLE_PATH
++
++FSR_URL = "https://gpuopen.com/manuals/fsr_sdk/"
++DLSS_URL = "https://github.com/danielblnc/DLSS-NR-on-AMD"
++
++
++def preferences():
++    return QSettings("REAL-Video-Enhancer", "AMDAcceleration")
++
++def active_profile(settings):
++    default = "fast" if os.environ.get("RVE_DEFAULT_FAST_INFERENCE") == "1" else "compatibility"
++    return settings.value("profile", default)
++
++def use_accelerate(settings):
++    return settings.value("accelerate", os.environ.get("RVE_DEFAULT_FAST_INFERENCE") == "1", type=bool)
++
++
++def render_environment():
++    settings = preferences()
++    env = os.environ.copy()
++    profile = active_profile(settings)
++    env["RVE_FAST_INFERENCE"] = "1" if profile in ("fast", "tuned") else "0"
++    env["RVE_TUNE_CONVOLUTION"] = "1" if profile == "tuned" else "0"
++    env["RVE_USE_ACCELERATE"] = "1" if use_accelerate(settings) else "0"
++    env["RVE_QUEUE_DEPTH"] = str(settings.value("queue_depth", 8, type=int))
++    return env
++
++
++class AccelerationDialog(QDialog):
++    def __init__(self, parent):
++        super().__init__(parent)
++        self.setWindowTitle("AMD acceleration and rendering speed")
++        self.resize(650, 600)
++        self.settings = preferences()
++        layout = QVBoxLayout(self)
++        intro = QLabel("Native ROCm runs neural models on your Radeon GPU. Select pytorch (rocm) in Processing.\n"
++                       "Use Settings → h264_amf, h265_amf, or av1_amf for AMD hardware encoding.\n"
++                       "Measured render FPS depends on resolution and model; playback FPS is a separate setting.")
++        intro.setWordWrap(True)
++        layout.addWidget(intro)
++        form = QFormLayout()
++        self.profile = QComboBox()
++        self.profile.addItem("Compatibility — standard model layout", "compatibility")
++        self.profile.addItem("Fast — shorter startup, optimized image layout", "fast")
++        self.profile.addItem("Tuned — searches for faster kernels, longer startup", "tuned")
++        self.profile.setCurrentIndex(max(0, self.profile.findData(active_profile(self.settings))))
++        self.accelerate = QCheckBox("Use Hugging Face Accelerate for transfers to the selected GPU")
++        self.accelerate.setChecked(use_accelerate(self.settings))
++        self.queue_depth = QSpinBox()
++        self.queue_depth.setRange(1, 25)
++        self.queue_depth.setValue(self.settings.value("queue_depth", 8, type=int))
++        self.queue_depth.setToolTip("Bounded frame queues keep RAM and VRAM use independent of movie length.")
++        form.addRow("Inference profile", self.profile)
++        form.addRow(self.accelerate)
++        form.addRow("Frames buffered per queue", self.queue_depth)
++        layout.addLayout(form)
++        tip = QLabel("For speed: use auto/float16 precision, a compact model, and hardware encoding.\n"
++                     "Test Fast against Compatibility on a short clip. Heavy restoration passes add work.\n"
++                     "Processing's Benchmark mode measures the pipeline without saving a movie.")
++        tip.setWordWrap(True)
++        layout.addWidget(tip)
++        for title, explanation, url in (
++            ("AMD FSR upscaling 4.1", "Unavailable for video files: the SDK requires a graphics renderer with depth, motion vectors and jitter. This app supplies decoded video frames.", FSR_URL),
++            ("DLSS 5 / DLSS-NR-on-AMD", "Unavailable for video files: this repository hooks DirectX 12 games with FSR and requires your own DLSS DLL. It exposes no offline video API.", DLSS_URL),
++        ):
++            option = QPushButton(title + " — unavailable")
++            option.setEnabled(False)
++            option.setToolTip(explanation)
++            layout.addWidget(option)
++            label = QLabel(explanation)
++            label.setWordWrap(True)
++            layout.addWidget(label)
++            link = QPushButton("Read " + title + " integration requirements")
++            link.clicked.connect(lambda checked=False, target=url: QDesktopServices.openUrl(QUrl(target)))
++            layout.addWidget(link)
++        self.diagnostics = QTextEdit()
++        self.diagnostics.setReadOnly(True)
++        self.diagnostics.setPlaceholderText("Check the actual interpreter, GPU runtime, FP16 and Accelerate below.")
++        layout.addWidget(self.diagnostics)
++        self.check = QPushButton("Check GPU acceleration")
++        self.check.clicked.connect(self.check_gpu)
++        layout.addWidget(self.check)
++        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
++        buttons.accepted.connect(self.save)
++        buttons.rejected.connect(self.reject)
++        layout.addWidget(buttons)
++        self.process = None
++
++    def check_gpu(self):
++        self.check.setEnabled(False)
++        self.diagnostics.clear()
++        self.process = QProcess(self)
++        self.process.setWorkingDirectory(CWD)
++        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
++        self.process.readyReadStandardOutput.connect(lambda: self.diagnostics.insertPlainText(bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")))
++        self.process.finished.connect(lambda code, status: self.check.setEnabled(True))
++        self.process.errorOccurred.connect(lambda error: (self.diagnostics.append(self.process.errorString()), self.check.setEnabled(True)))
++        self.process.start(PYTHON_EXECUTABLE_PATH, [os.path.join(CWD, "scripts", "check_acceleration.py")])
++
++    def done(self, result):
++        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
++            self.process.kill()
++            self.process.waitForFinished(1000)
++        super().done(result)
++
++    def save(self):
++        self.settings.setValue("profile", self.profile.currentData())
++        self.settings.setValue("accelerate", self.accelerate.isChecked())
++        self.settings.setValue("queue_depth", self.queue_depth.value())
++        self.settings.sync()
++        self.accept()
++
++    def closeEvent(self, event):
++        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
++            self.process.kill()
++        super().closeEvent(event)
++
++
++def install_acceleration_menu(window):
++    menu = window.menuBar().addMenu("Acceleration")
++    action = menu.addAction("AMD acceleration and rendering speed…")
++    action.triggered.connect(lambda: AccelerationDialog(window).exec())
+diff --git a/src/ui/ProcessTab.py b/src/ui/ProcessTab.py
+--- a/src/ui/ProcessTab.py
++++ b/src/ui/ProcessTab.py
+@@ -308,6 +308,8 @@
+                 "encoding": "utf-8",          # decode using utf-8
+                 "errors": "replace",
+             }
++            from .AMDAcceleration import render_environment
++            kwargs["env"] = render_environment()
+ 
+             if PLATFORM == "win32":
+                 kwargs["startupinfo"] = subprocess.STARTUPINFO()
+@@ -334,7 +336,7 @@
+                         self.currentFrame = int(
+                             re.search(r"Current Frame: (\d+)", line).group(1)
+                         )
+-                        self.fps = re.search(r"FPS: (\d+)", line).group(1)
++                        self.fps = re.search(r"FPS: ([\d.]+)", line).group(1)
+                         self.eta = re.search(r"ETA: (.+)", line).group(1)
+                         self.status = "Rendering"
+ 
+@@ -663,4 +665,4 @@
+ 
+ 
+ 
+-        return command
+\ No newline at end of file
++        return command
+diff --git a/src/ui/SettingsTab.py b/src/ui/SettingsTab.py
+--- a/src/ui/SettingsTab.py
++++ b/src/ui/SettingsTab.py
+@@ -32,6 +32,10 @@
+ 
+         }
+         self.settings = Settings()
++        if PLATFORM == "win32":
++            for encoder in ("h264_amf", "h265_amf", "av1_amf"):
++                if self.parent.encoder.findText(encoder) < 0:
++                    self.parent.encoder.addItem(encoder)
+         log("Settings: " + str(self.settings.settings))
+         self.connectSettingText() # has to be in this order, otherwise settings wont stick because they get reset.
+         self.connectWriteSettings()
+@@ -55,6 +59,12 @@
+         """
+         for key, value in self.ffmpeg_settings_dict.items():
+             self.settings.writeSetting(key, value.currentText())
++
++        if self.settings.settings['encoder'].endswith('_amf') and self.settings.settings['video_quality'] == 'Lossless':
++            # Avoid generating a lossy command under a lossless label.
++            self.parent.encoder.setCurrentText("ffv1")
++            self.settings.writeSetting("encoder", "ffv1")
++            RegularQTPopup("AMD hardware encoders do not guarantee lossless output. Switched to FFV1 for lossless encoding.")
+         
+         self.out_pixel_fmt = self.settings.settings['video_pixel_format']
+         pxfmtDict = {
+@@ -437,6 +447,9 @@
+                 "x264_nvenc",
+                 "x265_nvenc",
+                 "av1_nvenc (40 series and up)",
++                "h264_amf",
++                "h265_amf",
++                "av1_amf",
+             ),
+             "video_encoder_speed": ("placebo","slow", "medium", "fast", "fastest"),
+             "audio_encoder": ("aac", "libmp3lame", "opus", "copy_audio"),
